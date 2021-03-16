@@ -1,0 +1,509 @@
+---
+title: "frost2thredds.Rd"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(esd)
+```
+
+## R Markdown
+
+This is an R Markdown containing R utilities in order to read weather station data from FROST and save it to a NetCDF4. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+The R utilities have been extracted from the esd R package (https://esd.met.no)
+
+```{r define.elements}
+metno.frost.ele <- function() {
+  # TODO: wind direction is here so we can get DD06, DD12 and DD18 and perform an average.. how?
+  x <- rbind(
+    c("601" , "Precipitation"		, "1"	, "mm"		, "sum(precipitation_amount *)"),
+    c("401" , "Sea level pressure"	, "1"	, "hPa"		, "mean(surface_air_pressure *)"),
+    c("402" , "Sea level pressure"	, "1"	, "hPa"		, "min(surface_air_pressure *)"),
+    c("403" , "Sea level pressure"	, "1"	, "hPa"		, "max(surface_air_pressure *)"),
+    c("901" , "Snow depth"		, "1"	, "cm"		, "surface_snow_thickness"),
+    c("101" , "Mean temperature"	, "1"	, "degree*C"	, "mean(air_temperature *)"),
+    c("111" , "Maximum temperature"	, "1"	, "degree*C"	, "max(air_temperature *)"),
+    c("121" , "Minimum temperature"	, "1"	, "degree*C"	, "min(air_temperature *)"),
+    c("501" , "Wind speed"		, "1"	, "m/s"		, "mean(wind_speed *)"),
+    c("502" , "Wind direction"		, "1"	, "degrees"	, "wind_from_direction"),
+    c("503" , "Wind Gust"		, "1"	, "m/s"		, "max(wind_speed_of_gust *)")
+  )
+  y <- data.frame(element=x[,1] , longname = x[,2] , scale_factor = x[,3] , unit = x[,4] , param = x[,5] , source = "METNO.FROST" , stringsAsFactors = FALSE)
+  return(y)
+}
+
+meta <- metno.frost.ele()
+```
+
+```{r read.elements}
+#' Download METNO station metadata using frost.met.no
+#' 
+#' Where there are multiple measuring periods registered for the parameter,
+#' only the earliest start time and the latest end time are used.
+#' 
+#' @aliases metno.frost.meta.day metno.frost.meta.month
+#' 
+#' @param param Vector of parameters
+#' @param save2file if TRUE, save metadata in a local file
+#' @param verbose if TRUE, print diagnostics
+#' @param \dots additional arguments  
+#' @param url The URL to the webpage to request new client credentials at Frost API
+#'
+#' @return A meta data matrix object for all stations in METNO's collection
+#' that have measured any of the given parameters. Start and end time are included. 
+#'
+#' @author K. Tunheim
+#'
+#' @keywords parameter,metadata,metno,norway,frost
+#'
+#' @examples
+#' # Fetch all stations' measuring periods of the t2m parameter
+#' metno.frost.meta.min(param=c('t2m'))
+#' # Fetch all stations' measuring periods of all available parameters
+#' metno.frost.meta.min()
+
+metno.frost.meta.default <- function(keyfile='~/.FrostAPI.key', param=c("t2m"), 
+                                     timeresolutions="P1M", levels="default", timeoffsets="default", 
+                                     performancecategories="A,B,C", exposurecategories="1,2", 
+                                     url='https://frost.met.no/auth/requestCredentials.html',
+                                     browser="firefox", verbose = FALSE) {
+  if(verbose) print("metno.frost.meta.default")
+  if (!requireNamespace("jsonlite", quietly = TRUE)) {
+    stop("Package 'jsonlite' needed to use 'meta.frost.meta.default'. Please install it.")
+  } else {
+    
+    # KMP 2020-01-22: enable timeresolutions notation monthly and daily
+    timeresolutions <- switch(toupper(timeresolutions), 
+                              "MONTHLY"="P1M", "MONTH"="P1M",
+                              "DAILY"="P1D", "DAY"="P1D",
+                              "MINUTE"="PT1M", "MIN"="PT1M",
+                              timeresolutions)
+    
+    # convert all param to local param names
+    getparam1 <- function(x) {
+      withstar <- ele2param(x, src="METNO.FROST")$param
+      gsub('*', timeresolutions, withstar, fixed=TRUE)
+    }
+    ele <- sapply(param, esd2ele)
+    param1s <- sapply(ele, getparam1)
+    names(param1s) <- ele
+    strparam <- paste0(param1s, collapse=",")
+    if (verbose) print(strparam)
+    
+    # Get a client_id
+    if (file.exists(keyfile)) {
+      if (verbose) print(paste('Read client ID from',keyfile))
+      frostID <- readLines(keyfile) 
+    } else { 
+      if (verbose) print(paste('Generate new client ID from',url))  
+      system(paste(browser,url))
+      frostID <- rep("",2)
+      frostID[1] <- readline('Please give me the first key:')
+      frostID[2] <- readline('Please give me the second key:')
+      writeLines(frostID,con=keyfile)
+    }
+    
+    url1 <- paste0(
+      "https://", 
+      frostID[1],
+      #client_id, 
+      "@frost.met.no/",
+      "sources/v0.jsonld",
+      "?types=SensorSystem",
+      "&country=Norge",
+      "&validtime=0000-01-01/9999-01-01",
+      "&fields=id,name,masl,country,county,countyId,municipality,municipalityId,geometry"
+    )
+    # KT 2020-05-25 - fetch all stations in and around Svalbard too
+    url_sj <- paste0(
+      "https://",
+      frostID[1],
+      "@frost.met.no/",
+      "sources/v0.jsonld",
+      "?types=SensorSystem",
+      "&country=Svalbard og Jan Mayen",
+      "&validtime=0000-01-01/9999-01-01",
+      "&fields=id,name,masl,country,county,countyId,municipality,municipalityId,geometry"
+    )
+    url2 <- paste0(
+      "https://",
+      frostID[1],
+      "@frost.met.no/",
+      "observations/availableTimeSeries/v0.jsonld",
+      "?elements=", strparam,
+      "&timeresolutions=", timeresolutions,
+      "&levels=", levels,
+      "&timeoffsets=", timeoffsets,
+      "&performancecategories=", performancecategories,
+      "&exposurecategories=", exposurecategories,
+      "&fields=sourceId,elementId,validFrom,validTo"
+    )
+    if (verbose) {
+      print(url1)
+      print(url_sj)
+      print(url2)
+    }
+    
+    # KT 2020-05-26: getting data from both Norge and Svalbard and Jan Mayen
+    #browser()
+    xs_no <- jsonlite::fromJSON(URLencode(url1), flatten=TRUE)
+    xs_sj <- jsonlite::fromJSON(URLencode(url_sj), flatten=TRUE)
+    xs1 <- rbind(xs_no$data, xs_sj$data)
+    xs1$lon = sapply(xs1$geometry.coordinates, function(x) x[1])
+    xs1$lon[sapply(xs1$lon, is.null)] <- NA
+    xs1$lon <- unlist(xs1$lon)
+    xs1$lat = sapply(xs1$geometry.coordinates, function(x) x[2])
+    xs1$lat[sapply(xs1$lat, is.null)] <- NA
+    xs1$lat <- unlist(xs1$lat)
+    df1 <- xs1[c("id","name","country","lon","lat","masl","municipality","municipalityId","county","countyId")]
+    
+    xs2 <- jsonlite::fromJSON(URLencode(url2), flatten=TRUE)
+    df2 <- xs2$data
+    df2$sourceId = substring(df2$sourceId, 1, nchar(df2$sourceId)-2)
+    df <- data.frame(NULL)
+    for (i in 1:length(param1s)) {
+      # KT 2020-05-26: preserve NA as latest validTo
+      dfparam = df2[df2$elementId == param1s[i], ]
+      dfparam$validTo[is.na(dfparam$validTo)] = "9999-12-31T00:00:00.000Z"
+      validFrom = try(aggregate(validFrom ~ sourceId, data=dfparam, min), silent=TRUE)
+      validTo = try(aggregate(validTo ~ sourceId, data=dfparam, max), silent=TRUE)
+      validTo[validTo=="9999-12-31T00:00:00.000Z"] <- NA
+      if (class(validFrom) != "try-error" & length(validFrom) > 0) {
+        validFrom$validFrom <- as.Date(validFrom$validFrom)
+        validTo$validTo <- as.Date(validTo$validTo)
+        
+        period = merge(validFrom, validTo, by='sourceId', all.x=TRUE)
+        stperiod = merge(df1, period, by.x="id", by.y="sourceId")
+        
+        colnames(stperiod) = c("station_id","location","country","lon","lat","altitude",
+                               "municipality","municipalityid","county","countyid","start","end")
+        
+        stperiod$element <- rep(names(param1s[i]),length(stperiod$station_id))
+        
+        # convert to UTM
+        utmZone <- 33
+        XY <- LatLon2UTM(lat=stperiod$lat, lon=stperiod$lon, zone=utmZone)
+        stperiod$utm_east  <- XY[[1]]
+        stperiod$utm_north <- XY[[2]]
+        stperiod$utm_zone  <- rep(utmZone, length(stperiod$station_id))
+        
+        df <- rbind(stperiod, df, stringsAsFactors=FALSE)
+      }
+    }
+    #invisible(df)
+    
+    ## Same format as station.meta
+    var <- df$element
+    for(element in unique(df$element)) {
+      var[df$element==element] <- esd2ele(element)
+    }
+    cntr <- sapply(df$country, function(x) switch(x, "Norge"="NORWAY", x))
+    X <- data.frame("station_id"=gsub("[A-Z]|[a-z]","",df$station_id),
+                    "location"=df$location,
+                    "country"=cntr,
+                    "longitude"=df$lon,
+                    "latitude"=df$lat,
+                    "altitude"=df$altitude,
+                    "element"=df$element,
+                    "start"=strftime(df$start, format="%Y"),
+                    "end"=strftime(df$end, format="%Y"),
+                    "source"=switch(timeresolutions,
+                                    "P1D"="METNOD.FROST",
+                                    "P1M"="METNOM.FROST",
+                                    "PT1M"="METNO1M.FROST"),
+                    "wmo"=rep(NA,length(df$station_id)),
+                    "quality"=rep(NA,length(df$station_id)),
+                    "variable"=var, stringsAsFactors=FALSE)
+    attr(X,"metnoURLs") <- "http://frost.met.no"
+    attr(X,"author") <- "K. Tunheim & K. Parding"
+    attr(X,"date") <- Sys.time()
+    attr(X,"history") <- history.stamp(X)
+    class(X) <- c("stationmeta", class(X))
+    invisible(X)
+  }
+}
+
+# Do not export - not in use
+metno.frost.meta.minute <- function(param=c("t2m","precip","tmin","tmax","slp","pon","pox","fg","fx"),                                     save2file=FALSE, path=NULL, verbose=FALSE, ...) {
+  
+  if(verbose) print("metno.frost.meta.min")
+  X <- metno.frost.meta.default(param=param, timeresolutions="PT1M", verbose=verbose, ...)
+  filename <- "meta.metno.frost.1min.rda"
+  attr(X, "source") <- "METNO.FROST.MINUTE"
+  attr(X, "version") <- NA
+  attr(X, "URL") <- "http://frost.met.no"
+  attr(X, "file") <- filename
+  attr(X, "cite") <- ""
+  attr(X, "date") <- date()
+  attr(X,"call") <- match.call()
+  attr(X, "history") <- history.stamp(X)
+  if (save2file) {
+    meta.metno.frost.min <- X
+    if(!is.null(path)) filename <- file.path(path,filename)
+    save(meta.metno.frost.min, file=filename)
+    rm("meta.metno.frost.min")
+  }
+  invisible(X)
+}
+
+#meta <- metno.frost.meta.minute(param='precip',save2file = FALSE,verbose = TRUE)
+```
+
+## saving to NetCDF files
+
+You can also embed plots, for example:
+
+```{r historical, echo=FALSE}
+
+
+# Create historical files
+
+#it <- as.POSIXct(c("2019-02-18 00:00:00","2021-01-31 00:05:00"))
+
+
+meta <- metno.frost.meta.minute(param = 'precip', save2file=FALSE, verbose=TRUE)
+
+generate.1 <- function(param = 'precip', it ,FUN='sum',verbose = TRUE) {
+  #it <- seq(it, it, by = 5 * 60)
+  x <- station(x = meta, param = param, it = it, src='METNO1M.FROST',verbose = TRUE)
+  #browser()
+  if (!is.null(FUN)) {
+    if (verbose) print(paste('Apply ',FUN,' over time'))
+    x <- map.station(x, FUN = FUN, plot = FALSE, verbose = verbose)
+    index(x) <- as.POSIXct(attr(x,'period'))[2] + 60
+    }
+  
+  # it <- gsub("[[:punct:]]", "", it)
+  # it <- gsub(' ','T',it)
+  
+  # save as netcdf
+  frost2ncdf4(x,verbose = TRUE)
+}
+
+generate.all <- function(){
+  it.start <- as.POSIXct("2019-01-01 00:00:00")
+  it.end <- as.POSIXct(Sys.time())
+  
+  it <- seq(from = it.start,
+            to   = it.end,
+            by   = 5*60) # 5 minutes interval
+  
+  # Convert to days
+  vdays <- seq(from = round(it.start,units='days'),
+               to   = round(it.end,units='days') ,
+               by   ='day')
+  
+  for (i in 1835:(length(it)-1)) {
+    it.i <- c(it[i],it[i+1])
+    generate.1(it = it.i)
+  }
+}
+```
+
+## Realtime reading and saving
+
+```{r realtime, echo=FALSE}
+it <- seq(from = as.POSIXct("2019-01-01 00:00:00"),
+          to   = as.POSIXct(Sys.time()),
+          by   = 5*60) # 5 minutes
+
+# Create historical files
+
+it <- as.POSIXct(c("2021-02-18 00:00:00","2021-02-18 00:05:00"))
+x <- station(x = meta, param = 'precip', it = it, src='METNO1M.FROST',verbose = TRUE)
+gsub("[[:punct:]]", "", it[2])
+write2ncdf4(x,file = 'precipitation-mm-norway.frost2ncdf.20210219T091500Z.nc')
+```
+
+## Write to NetCDF4 file
+```{r write2ncdf}
+frost2ncdf4 <- function(x, FUN= 'sum', namelength=24, prec='short', missval = -999, 
+                        verbose = TRUE, force = TRUE) {
+  
+  if (verbose) print('Define dimensions')
+  if (verbose) print(stid(x))
+  dimS <- ncdim_def(name     = "id", 
+                    units    = "",  
+                    vals     = 1:length(stid(x)),
+                    longname = "increment station number",
+                    unlim    = TRUE)
+  dimT <- ncdim_def(name     = "time",
+                    longname = "time",
+                    units    = "seconds since 1970-01-01 00:00:00 +00:00", 
+                    vals     = as.numeric(difftime(index(x), 
+                                                   as.POSIXct('1970-01-01 00:00:00',
+                                                              format= "%Y-%m-%d %H:%M:%OS"), 
+                                                   units = 'secs')), 
+                    calendar = 'standard',
+                    unlim    = TRUE)
+  
+  dimnchar <-ncdim_def(name  = "nchar",
+                       units = "", 
+                       vals  = 1:namelength,
+                       create_dimvar = FALSE )
+  # Generate path and filename 
+  stamp <- gsub(pattern     = "[[:punct:]]", 
+                replacement = "", 
+                x           = paste0(gsub(' ','T',as.character(index(x))),'Z')) # e.g. 20210219T091500Z
+  
+   # Path to file
+  path <- file.path(attr(x,'longname'),
+                    as.character(year(x)), # Year subfolder
+                    ifelse(nchar(as.character(month(x))) == 1,paste0('0',month(x)),month(x)),
+                    ifelse(nchar(as.character(day(x))) == 1,paste0('0',day(x)),day(x))) # Month subfolder
+  if (!file.exists(path))
+    dir.create(path = path, recursive = TRUE)
+  
+  filename <-  paste0(unique(attr(x,'longname')),'-',
+                      unique(unit(x)),'-',
+                      unique(cntr(x)),
+                      '.frost2ncdf.', 
+                      stamp,'.nc')
+  
+  if (verbose) {
+    print('Define variable')
+    print(paste('create netCDF-file',filename))
+  }
+  
+  if (verbose) 
+    print('Define the netCDF structure')
+  
+  latid <- ncvar_def(name     = "lat",
+                     dim      = list(dimS), 
+                     units    = "degrees_north", 
+                     missval  = missval,
+                     longname = "latitude", 
+                     prec     = "float",
+                     verbose  = verbose)
+  
+  lonid <- ncvar_def(name     = "lon",
+                     dim      = list(dimS), 
+                     units    = "degrees_east", 
+                     missval  = missval,
+                     longname = "longitude", 
+                     prec     = "float",
+                     verbose  = verbose)
+  
+  xid <- ncvar_def(name     = "X",
+                   dim      = list(dimS), 
+                   units    = "meters", 
+                   missval  = missval,
+                   longname = "X coordinate to the east ", 
+                   prec     = "float",
+                   verbose  = verbose)
+  
+  yid <- ncvar_def(name     = "Y",
+                   dim      = list(dimS), 
+                   units    = "meters", 
+                   missval  = missval,
+                   longname = "Y coordinate to the North", 
+                   prec     = "float",
+                   verbose  = verbose)
+  
+  altid <- ncvar_def(name     = "alt",
+                     dim      = list(dimS), 
+                     units    = "meters", 
+                     missval  = missval,
+                     longname = "altitude", 
+                     prec     = prec,
+                     verbose  = verbose)
+  
+  locid <- ncvar_def(name     = "loc",
+                     dim      = list(dimnchar,dimS),
+                     units    = "",
+                     prec     = "char",
+                     longname = "location name",
+                     verbose  = verbose)
+  
+  stid <- ncvar_def(name      = "stid", 
+                    dim       = list(dimnchar,dimS),
+                    units     = "",
+                    prec      = "char",
+                    longname  = "station identification number",
+                    verbose   = verbose)
+  
+  cntrid <- ncvar_def(name    = "cntr",
+                      dim     = list(dimnchar,dimS),
+                      units   = "",
+                      prec    = "char",
+                      longname= "country name",
+                      verbose = verbose)
+  
+  if (verbose) {
+    print(paste('ncvar:',varid(x)[1]))
+    print(unit(x))
+  }
+  
+  
+  ncvar <- ncvar_def(name     = varid(x)[1], 
+                     dim      = list(dimS,dimT), 
+                     units    = unique(unit(x)),
+                     longname = '5 minutes accumulated precipitation (0,1,2,3,4 minutes)', #tolower(attr(x,'longname')[1]),
+                     prec     = "double",
+                     verbose  = verbose)
+  if (file.exists(file.path(path, filename)) & force) 
+    file.remove(file.path(path, filename))
+  ncid <- nc_create(filename = file.path(path, filename),
+                    vars     = list(ncvar,lonid,xid,latid,yid,altid,locid,stid,cntrid),
+                    verbose  = verbose)
+  ## Writing the data into the file
+  
+  start <- c(1,1); 
+  count <- c(length(stid(x)),length(index(x)))
+  ## var precip
+  ncvar_put(nc = ncid, 
+            varid = ncvar,
+            vals = as.numeric(x),
+            start = start,
+            count = count)
+  
+  ## Put variables
+  ncvar_put(nc = ncid, varid = lonid, vals = as.numeric(lon(x)), start = 1, count = length(lon(x)))
+  ncvar_put(nc = ncid, varid = latid, vals = as.numeric(lat(x)), start = 1, count = length(lat(x)))
+  # Convert lon and lat to X and Y
+  # browser()
+  XY <- LatLon2UTM(lat = lat(x), lon = lon(x), zone = 33)
+  ncvar_put(nc = ncid, varid = yid, vals = as.numeric(XY[[1]]), start = 1, count = length(stid(x)))
+  ncvar_put(nc = ncid, varid = xid, vals = as.numeric(XY[[2]]), start = 1, count = length(stid(x)))
+  ncvar_put(nc = ncid, varid = stid, vals = as.numeric(stid(x)), start = start, count = c(namelength,length(stid(x))))
+  ncvar_put(nc = ncid, varid = locid, vals = as.character(loc(x)), start = start, count = c(namelength,length(stid(x))))
+  ncvar_put(nc = ncid, varid = cntrid, vals = as.character(cntr(x)), start = start, count = c(namelength,length(stid(x))))
+  
+  
+  ## Put global attributes
+  if (verbose) print('Writing global attributes')
+  ncatt_put(ncid, 0, 'institution', 'Norwegian Meteorological Institute')
+  ncatt_put(ncid, 0, 'date_created', as.character(Sys.time()))
+  ncatt_put(ncid, 0, 'Conventions', 'CF-1.6')
+  ncatt_put(ncid, 0, 'title', 'Observations from MET Norway weather stations')
+  ncatt_put(ncid, 0, 'institution', 'Norwegian Meteorological Institute')
+  ncatt_put(ncid, 0, 'source', 'Meterological surface observations via frost.met.no')
+  ncatt_put(ncid, 0, 'history', 'frost write netcdf')
+  ncatt_put(ncid, 0, 'references', '') 
+  ncatt_put(ncid, 0, 'acknowledgment', 'MET Norway via frost.met.no')
+  ncatt_put(ncid, 0, 'comment', '5 minutes observations data retrieved from frost.met.no')
+  ncatt_put(ncid, 0, 'creator_email', 'abdelakderm@met.no')
+  ncatt_put(ncid, 0, 'creator_name', 'Norwegian Meteorological Institute')
+  ncatt_put(ncid, 0, 'creator_url', 'https://www.met.no')
+  ncatt_put(ncid, 0, 'geospatial_bounds', '')
+  ncatt_put(ncid, 0, 'geospatial_bounds_crs', 'latlon')
+  ncatt_put(ncid, 0, 'geospatial_lat_max', max(lat(x),na.rm = TRUE))
+  ncatt_put(ncid, 0, 'geospatial_lat_min', min(lat(x),na.rm = TRUE))
+  ncatt_put(ncid, 0, 'geospatial_lon_max', max(lon(x),na.rm = TRUE))
+  ncatt_put(ncid, 0, 'geospatial_lon_min', min(lon(x),na.rm = TRUE))
+  ncatt_put(ncid, 0, 'id','add doi here if needed')
+  ncatt_put(ncid, 0, 'keywords', 'observations')
+  ncatt_put(ncid, 0, 'metadata_link', '')
+  ncatt_put(ncid, 0, 'summary', 'Surface meteorological observations from the observation network operated by the Norwegian Meteorological Institute.')
+  #ncatt_put(ncid, 0, 'time_coverage_start', it.start)
+  #ncatt_put(ncid, 0, 'time_coverage_end', it.end)
+  #ncatt_put(ncid, 0, 'featureType', 'timeSeries')
+  
+  if (verbose) print('Closing connection to NetCDF file')
+  nc_close(ncid)
+  if (verbose) print('Done!')
+}
+```
+
